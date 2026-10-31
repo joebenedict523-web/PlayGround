@@ -148,6 +148,59 @@ export class Particles {
   }
 }
 
+export function createRain(scene, count = 1400) {
+  const positions = new Float32Array(count * 6);
+  const drops = new Float32Array(count * 4); // x, z, y, speed
+  for (let i = 0; i < count; i++) {
+    const i4 = i * 4;
+    drops[i4] = (Math.random() - 0.5) * 76;
+    drops[i4 + 1] = (Math.random() - 0.5) * 76;
+    drops[i4 + 2] = Math.random() * 24;
+    drops[i4 + 3] = 11 + Math.random() * 9;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.LineBasicMaterial({
+    color: 0xa8c8e4,
+    transparent: true,
+    opacity: 0.2,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    toneMapped: false,
+  });
+  const lines = new THREE.LineSegments(geometry, material);
+  lines.frustumCulled = false;
+  scene.add(lines);
+
+  return {
+    lines,
+    update(dt, time) {
+      const pos = geometry.attributes.position.array;
+      const wind = 1.6 + Math.sin(time * 0.21) * 0.8;
+      for (let i = 0; i < count; i++) {
+        const i4 = i * 4;
+        const i6 = i * 6;
+        drops[i4 + 2] -= drops[i4 + 3] * dt;
+        drops[i4] += wind * dt;
+        if (drops[i4 + 2] < 0) {
+          drops[i4 + 2] = 18 + Math.random() * 8;
+          drops[i4] = (Math.random() - 0.5) * 76;
+          drops[i4 + 1] = (Math.random() - 0.5) * 76;
+        }
+        if (drops[i4] > 38) drops[i4] = -38;
+        const len = 0.32 + drops[i4 + 3] * 0.018;
+        pos[i6] = drops[i4];
+        pos[i6 + 1] = drops[i4 + 2];
+        pos[i6 + 2] = drops[i4 + 1];
+        pos[i6 + 3] = drops[i4] - wind * 0.018;
+        pos[i6 + 4] = drops[i4 + 2] - len;
+        pos[i6 + 5] = drops[i4 + 1];
+      }
+      geometry.attributes.position.needsUpdate = true;
+    },
+  };
+}
+
 export function createDust(scene) {
   const count = 320;
   const positions = new Float32Array(count * 3);

@@ -1,7 +1,14 @@
 import * as THREE from 'three';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { createWorld, makeProp, PROP_SPAWNS } from './world.js';
-import { Particles, createDust } from './particles.js';
+import { Particles, createDust, createRain } from './particles.js';
 import { AudioEngine } from './audio.js';
+import { environmentTexture } from './materials.js';
 
 const $ = (id) => document.getElementById(id);
 const clamp = THREE.MathUtils.clamp;
@@ -15,15 +22,18 @@ document.body.classList.toggle('touch-ui', isTouch);
 const canvas = $('game');
 const renderer = new THREE.WebGLRenderer({
   canvas,
-  antialias: false,
+  antialias: true,
   powerPreference: 'high-performance',
   alpha: false,
+  stencil: false,
 });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.25;
+renderer.toneMappingExposure = 1.15;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.05, 400);
@@ -31,9 +41,69 @@ camera.rotation.order = 'YXZ';
 scene.add(camera);
 
 // suit lamp — keeps the foreground readable without flattening the scene
-const suitLight = new THREE.PointLight(0xffd2a4, 30, 22, 2);
-suitLight.position.set(0.3, -0.15, -1.2);
+const suitLight = new THREE.PointLight(0xffd2a4, 12, 14, 2);
+suitLight.position.set(0.3, -0.15, -1.5);
 camera.add(suitLight);
+
+// dedicated soft key for the first-person models, from behind the player's shoulder
+const viewLight = new THREE.PointLight(0xffe2c8, 3.4, 3.2, 2);
+viewLight.position.set(0.22, 0.28, 0.2);
+camera.add(viewLight);
+
+// image-based lighting: a procedural night-city panorama drives metal and wet reflections
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+const envSource = environmentTexture();
+envSource.mapping = THREE.EquirectangularReflectionMapping;
+const envTarget = pmrem.fromEquirectangular(envSource);
+scene.environment = envTarget.texture;
+scene.environmentIntensity = 0.85;
+envSource.dispose();
+pmrem.dispose();
+
+// post stack: subtle bloom for emissive signs and plasma, MSAA for clean edges
+const usePost = !isTouch;
+let composer = null;
+let bloomPass = null;
+let gtaoPass = null;
+if (usePost) {
+  const renderTarget = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+    type: THREE.HalfFloatType,
+    samples: 2,
+  });
+  composer = new EffectComposer(renderer, renderTarget);
+  composer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  composer.addPass(new RenderPass(scene, camera));
+  // Contact shadows and crevice darkening. Kept subtle so the night scene does
+  // not lose its readable silhouettes.
+  gtaoPass = new GTAOPass(scene, camera, window.innerWidth, window.innerHeight);
+  gtaoPass.output = GTAOPass.OUTPUT.Default;
+  gtaoPass.blendIntensity = 0.5;
+  gtaoPass.updateGtaoMaterial({
+    radius: 0.55,
+    distanceExponent: 1.8,
+    thickness: 1.0,
+    scale: 1.0,
+    samples: 8,
+  });
+  gtaoPass.updatePdMaterial({
+    lumaPhi: 10,
+    depthPhi: 2,
+    normalPhi: 3,
+    radius: 6,
+    rings: 2,
+    samples: 8,
+  });
+  composer.addPass(gtaoPass);
+  bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    0.34,
+    0.55,
+    0.82
+  );
+  composer.addPass(bloomPass);
+  composer.addPass(new OutputPass());
+}
 
 const clock = new THREE.Clock();
 
@@ -41,6 +111,7 @@ const clock = new THREE.Clock();
 const world = createWorld(scene);
 const particles = new Particles(scene);
 const dust = createDust(scene);
+const rain = createRain(scene);
 const audio = new AudioEngine();
 
 // ---------------------------------------------------------------- player
@@ -236,7 +307,11 @@ class Drone {
     group.add(glow);
 
     group.traverse((o) => {
-      if (o.isMesh) o.userData.enemy = this;
+      if (o.isMesh) {
+        o.userData.enemy = this;
+        o.castShadow = true;
+        o.receiveShadow = true;
+      }
     });
     group.userData.enemy = this;
     scene.add(group);
@@ -337,94 +412,196 @@ class Drone {
 const viewModels = new THREE.Group();
 camera.add(viewModels);
 
+function viewMaterial(color, roughness = 0.44, metalness = 0.38) {
+  return new THREE.MeshStandardMaterial({
+    color,
+    roughness,
+    metalness,
+    envMapIntensity: 1.0,
+    emissive: 0x080d12,
+    emissiveIntensity: 0.6,
+  });
+}
+
 function buildGun() {
   const g = new THREE.Group();
-  const dark = new THREE.MeshBasicMaterial({ color: 0x10161b });
-  const mid = new THREE.MeshBasicMaterial({ color: 0x27323b });
-  const light = new THREE.MeshBasicMaterial({ color: 0x46545f });
+  const dark = viewMaterial(0x11161b, 0.52, 0.28);
+  const mid = viewMaterial(0x303b45, 0.38, 0.5);
+  const light = viewMaterial(0x5b6b77, 0.28, 0.62);
+  const gripMat = viewMaterial(0x161b20, 0.78, 0.08);
+  const gripPanel = viewMaterial(0x242c33, 0.7, 0.18);
+  const glove = viewMaterial(0x241e17, 0.86, 0.04);
+  const glovePad = viewMaterial(0x46392a, 0.8, 0.06);
+  const gloveCuff = viewMaterial(0x1b1915, 0.62, 0.28);
   const glow = new THREE.MeshBasicMaterial({ color: 0x66d9ff, toneMapped: false });
+  const orangeGlow = new THREE.MeshBasicMaterial({ color: 0xff9d2e, toneMapped: false });
 
-  // Fake directional shading: unlit viewmodel boxes read as flat slabs unless each
-  // face gets its own value. Box material order is +x, -x, +y, -y, +z, -z.
+  // Per-face values keep the silhouette readable even when the suit lamp is behind it.
+  // Box material order is +x, -x, +y, -y, +z, -z.
   const shaded = (topColor, sideColor, bottomColor, frontColor) => {
-    const topM = new THREE.MeshBasicMaterial({ color: topColor });
-    const sideM = new THREE.MeshBasicMaterial({ color: sideColor });
-    const bottomM = new THREE.MeshBasicMaterial({ color: bottomColor });
-    const frontM = new THREE.MeshBasicMaterial({ color: frontColor });
+    const topM = viewMaterial(topColor, 0.34, 0.5);
+    const sideM = viewMaterial(sideColor, 0.42, 0.45);
+    const bottomM = viewMaterial(bottomColor, 0.52, 0.35);
+    const frontM = viewMaterial(frontColor, 0.38, 0.48);
     return [sideM, sideM, topM, bottomM, frontM, frontM];
   };
   const box = (w, h, d, mats, x, y, z, rx = 0) => {
-    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mats);
+    const radius = Math.min(w, h, d) * 0.18;
+    const m = new THREE.Mesh(new RoundedBoxGeometry(w, h, d, 3, radius), mats);
     m.position.set(x, y, z);
     m.rotation.x = rx;
     g.add(m);
     return m;
   };
 
-  const slideMats = shaded(0x3d4a55, 0x232d35, 0x141b21, 0x1d262d);
-  const bodyMats = shaded(0x34414b, 0x1d262d, 0x0e1216, 0x161d23);
-  const gripMats = shaded(0x2c363f, 0x171e24, 0x0b0e11, 0x12171c);
+  // The slide is extruded from a proper pistol side profile instead of being a
+  // single rounded box. This gives the front nose, rear taper and top chamfer
+  // that read immediately as a handgun silhouette.
+  const slideShape = new THREE.Shape();
+  slideShape.moveTo(-0.255, 0.028);
+  slideShape.lineTo(0.118, 0.028);
+  slideShape.lineTo(0.118, 0.095);
+  slideShape.lineTo(0.075, 0.114);
+  slideShape.lineTo(-0.188, 0.11);
+  slideShape.lineTo(-0.232, 0.09);
+  slideShape.lineTo(-0.255, 0.064);
+  slideShape.lineTo(-0.255, 0.028);
+  const slideGeo = new THREE.ExtrudeGeometry(slideShape, {
+    depth: 0.09,
+    bevelEnabled: true,
+    bevelThickness: 0.004,
+    bevelSize: 0.004,
+    bevelSegments: 2,
+    curveSegments: 1,
+  });
+  slideGeo.translate(0, 0, -0.045);
+  slideGeo.rotateY(-Math.PI / 2);
+  const slideMats = [viewMaterial(0x171e24, 0.5, 0.44), viewMaterial(0x2b353e, 0.42, 0.48)];
+  const slide = new THREE.Mesh(slideGeo, slideMats);
+  slide.position.set(0, 0.012, -0.01);
+  g.add(slide);
 
-  box(0.1, 0.105, 0.29, bodyMats, 0, 0.01, -0.01);
-  box(0.088, 0.05, 0.31, slideMats, 0, 0.078, -0.02);
-  // edge chamfers soften the top silhouette so the slide does not read as a flat slab
-  box(0.014, 0.014, 0.31, shaded(0x35424c, 0x202932, 0x12181d, 0x1a2229), -0.041, 0.097, -0.02, 0);
-  box(0.014, 0.014, 0.31, shaded(0x35424c, 0x202932, 0x12181d, 0x1a2229), 0.041, 0.097, -0.02, 0);
+  const frameMats = shaded(0x2d3842, 0x192128, 0x0b0f13, 0x131a20);
+  const bodyMats = shaded(0x27323b, 0x171e24, 0x090d10, 0x11181e);
+  box(0.074, 0.05, 0.30, frameMats, 0, 0.005, -0.02);
+  box(0.064, 0.032, 0.205, bodyMats, 0, -0.021, -0.13);
+  box(0.076, 0.014, 0.11, bodyMats, 0, 0.001, 0.075);
 
-  // raised slide rib + rear sight notch so the top face is not one blank plane
-  box(0.026, 0.008, 0.26, shaded(0x485661, 0x2c3740, 0x161d23, 0x232d35), 0, 0.107, -0.03);
-  box(0.012, 0.026, 0.014, shaded(0x2f3a44, 0x1a2228, 0x0f1418, 0x171e24), -0.031, 0.122, 0.088);
-  box(0.012, 0.026, 0.014, shaded(0x2f3a44, 0x1a2228, 0x0f1418, 0x171e24), 0.031, 0.122, 0.088);
-  box(0.075, 0.007, 0.012, shaded(0x10161b, 0x10161b, 0x10161b, 0x10161b), 0, 0.111, 0.088);
-
-  const port = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.028, 0.07), dark);
-  port.position.set(0.0505, 0.075, 0.01);
-  g.add(port);
+  // under-barrel accessory rail
   for (let i = 0; i < 3; i++) {
-    const serration = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.028, 0.008), dark);
-    serration.position.set(0.0505, 0.075, 0.08 + i * 0.016);
-    g.add(serration);
+    box(0.058, 0.007, 0.012, shaded(0x0a0e11, 0x0a0e11, 0x0a0e11, 0x0a0e11), 0, -0.041, -0.155 + i * 0.052);
   }
 
-  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.024, 0.026, 0.16, 8), mid);
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.024, 0.12, 12), mid);
   barrel.rotation.x = Math.PI / 2;
-  barrel.position.set(0, 0.035, -0.23);
+  barrel.position.set(0, 0.055, -0.27);
   g.add(barrel);
-
-  const muzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 0.05, 8), light);
+  const muzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.045, 12), light);
   muzzle.rotation.x = Math.PI / 2;
-  muzzle.position.set(0, 0.035, -0.31);
+  muzzle.position.set(0, 0.055, -0.335);
   g.add(muzzle);
-  const muzzleRing = new THREE.Mesh(new THREE.TorusGeometry(0.025, 0.005, 4, 12), dark);
-  muzzleRing.position.set(0, 0.035, -0.336);
+  const muzzleRing = new THREE.Mesh(new THREE.TorusGeometry(0.021, 0.0045, 4, 16), dark);
+  muzzleRing.position.set(0, 0.055, -0.358);
   g.add(muzzleRing);
 
-  box(0.072, 0.19, 0.095, gripMats, 0, -0.12, 0.095, -0.22);
-  box(0.078, 0.018, 0.1, shaded(0x222b33, 0x161d23, 0x0b0e11, 0x101519), 0, -0.211, 0.12, -0.22);
-  box(0.04, 0.15, 0.006, shaded(0x3a4752, 0x232d35, 0x131a20, 0x1a222a), 0, -0.11, 0.144, -0.22);
-  for (let i = 0; i < 4; i++) {
-    box(0.05, 0.008, 0.006, shaded(0x0c1014, 0x0c1014, 0x0c1014, 0x0c1014), 0, -0.075 - i * 0.022, 0.143, -0.22);
+  // left-side detail: ejection port, serrations, slide-stop and takedown pin
+  box(0.002, 0.026, 0.075, dark, -0.048, 0.082, -0.035);
+  box(0.002, 0.007, 0.085, light, -0.049, 0.069, -0.035);
+  for (let i = 0; i < 5; i++) {
+    box(0.002, 0.035, 0.006, light, -0.048, 0.078, 0.038 + i * 0.014);
   }
+  box(0.009, 0.012, 0.062, mid, -0.05, 0.044, 0.018);
+  const takedown = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.01, 10), light);
+  takedown.rotation.z = Math.PI / 2;
+  takedown.position.set(-0.048, 0.045, -0.065);
+  g.add(takedown);
 
-  box(0.058, 0.11, 0.06, shaded(0x2d3943, 0x1a2229, 0x0d1115, 0x161d23), 0, -0.09, 0.045, -0.12);
-
-  const guard = new THREE.Mesh(new THREE.TorusGeometry(0.036, 0.008, 5, 12, Math.PI), dark);
-  guard.rotation.set(0, Math.PI / 2, Math.PI);
-  guard.position.set(0, -0.062, 0.006);
-  g.add(guard);
-
-  box(0.009, 0.018, 0.13, glow, -0.053, 0.045, -0.04);
-  box(0.004, 0.012, 0.1, glow, 0.0575, 0.02, -0.1);
-  box(0.008, 0.055, 0.16, shaded(0x36434e, 0x1c252c, 0x0e1317, 0x161e25), 0.053, -0.005, 0);
-
-  // front sight blade with a cyan insert
-  box(0.009, 0.026, 0.01, shaded(0x46545f, 0x27323b, 0x12181d, 0x1e262d), 0, 0.122, -0.155);
-  const sightDot = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.008, 0.003), glow);
-  sightDot.position.set(0, 0.124, -0.162);
+  // slide-top rib, rear sight and front sight
+  box(0.028, 0.007, 0.24, shaded(0x303b44, 0x1c242b, 0x0e1418, 0x171e24), 0, 0.132, -0.045);
+  box(0.012, 0.024, 0.014, shaded(0x303b45, 0x192128, 0x0d1115, 0x151d23), -0.029, 0.15, 0.075);
+  box(0.012, 0.024, 0.014, shaded(0x303b45, 0x192128, 0x0d1115, 0x151d23), 0.029, 0.15, 0.075);
+  box(0.07, 0.006, 0.012, dark, 0, 0.153, 0.075);
+  box(0.009, 0.026, 0.012, shaded(0x46545f, 0x27323b, 0x12181d, 0x1e262d), 0, 0.15, -0.185);
+  const sightDot = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.007, 0.003), orangeGlow);
+  sightDot.position.set(0, 0.152, -0.192);
   g.add(sightDot);
 
+  // small cyan status strip and a rear indicator keep the Combine styling subtle
+  box(0.002, 0.01, 0.072, glow, -0.049, 0.058, -0.035);
+  const indicator = new THREE.Mesh(new THREE.BoxGeometry(0.008, 0.008, 0.003), orangeGlow);
+  indicator.position.set(0.035, 0.118, 0.112);
+  g.add(indicator);
+
+  // grip, magazine floorplate and checkering
+  const grip = new THREE.Mesh(new RoundedBoxGeometry(0.082, 0.2, 0.105, 3, 0.018), gripMat);
+  grip.position.set(0, -0.12, 0.10);
+  grip.rotation.x = -0.22;
+  g.add(grip);
+  box(0.078, 0.016, 0.108, shaded(0x2a333b, 0x171e24, 0x0b0f13, 0x12191f), 0, -0.219, 0.125, -0.22);
+  box(0.04, 0.145, 0.008, gripPanel, -0.042, -0.115, 0.145, -0.22);
+  for (let i = 0; i < 5; i++) {
+    box(0.046, 0.006, 0.005, dark, -0.043, -0.065 - i * 0.022, 0.15, -0.22);
+  }
+
+  // trigger guard and trigger
+  const guard = new THREE.Mesh(new THREE.TorusGeometry(0.042, 0.007, 5, 16, Math.PI), dark);
+  guard.rotation.set(0, Math.PI / 2, Math.PI);
+  guard.position.set(0, -0.062, 0.012);
+  g.add(guard);
+  const trigger = new THREE.Mesh(new RoundedBoxGeometry(0.012, 0.036, 0.012, 2, 0.004), light);
+  trigger.position.set(0, -0.062, 0.012);
+  trigger.rotation.x = -0.3;
+  g.add(trigger);
+
+  // hammer and beavertail
+  box(0.026, 0.026, 0.022, mid, 0, 0.07, 0.125, 0.35);
+  box(0.05, 0.018, 0.06, bodyMats, 0, 0.035, 0.125, 0.12);
+
+  // gloved hand: palm behind the grip, fingers wrapping the near side, cuff
+  // and forearm continuing off the bottom of the frame.
+  const hand = new THREE.Group();
+  hand.scale.setScalar(0.9);
+  hand.position.set(0, -0.018, 0.012);
+  const palm = new THREE.Mesh(new RoundedBoxGeometry(0.1, 0.14, 0.115, 3, 0.03), glove);
+  palm.position.set(0.004, -0.15, 0.185);
+  palm.rotation.x = -0.22;
+  hand.add(palm);
+  for (let i = 0; i < 4; i++) {
+    const finger = new THREE.Mesh(
+      new RoundedBoxGeometry(0.032, 0.023, 0.096, 2, 0.009),
+      glove
+    );
+    finger.position.set(-0.054, -0.074 - i * 0.024, 0.10);
+    finger.rotation.x = -0.22;
+    hand.add(finger);
+    const knuckle = new THREE.Mesh(new RoundedBoxGeometry(0.026, 0.02, 0.026, 2, 0.007), glovePad);
+    knuckle.position.set(-0.064, -0.074 - i * 0.024, 0.152);
+    knuckle.rotation.x = -0.22;
+    hand.add(knuckle);
+  }
+  const thumb = new THREE.Mesh(new RoundedBoxGeometry(0.032, 0.03, 0.09, 2, 0.009), glove);
+  thumb.position.set(-0.055, -0.045, 0.165);
+  thumb.rotation.set(-0.2, 0.18, 0.1);
+  hand.add(thumb);
+  const thumbPad = new THREE.Mesh(new RoundedBoxGeometry(0.022, 0.014, 0.05, 2, 0.005), glovePad);
+  thumbPad.position.set(-0.067, -0.038, 0.18);
+  thumbPad.rotation.set(-0.2, 0.18, 0.1);
+  hand.add(thumbPad);
+  const sleeve = new THREE.Mesh(new RoundedBoxGeometry(0.11, 0.22, 0.14, 3, 0.035), gloveCuff);
+  sleeve.position.set(0.02, -0.3, 0.23);
+  sleeve.rotation.x = -0.34;
+  hand.add(sleeve);
+  const cuff = new THREE.Mesh(new THREE.TorusGeometry(0.068, 0.006, 4, 20), orangeGlow);
+  cuff.rotation.x = Math.PI / 2;
+  cuff.position.set(0.02, -0.215, 0.205);
+  hand.add(cuff);
+  const gloveLight = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.006, 0.012), orangeGlow);
+  gloveLight.position.set(0.004, -0.118, 0.245);
+  hand.add(gloveLight);
+  g.add(hand);
+
   const muzzlePoint = new THREE.Object3D();
-  muzzlePoint.position.set(0, 0.035, -0.345);
+  muzzlePoint.position.set(0, 0.055, -0.37);
   g.add(muzzlePoint);
   g.userData.muzzle = muzzlePoint;
 
@@ -432,57 +609,75 @@ function buildGun() {
     map: glowTexture, color: 0xffc06a, transparent: true, opacity: 0.95,
     blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
   }));
-  flash.position.set(0, 0.035, -0.36);
+  flash.position.set(0, 0.055, -0.39);
   flash.scale.set(0.2, 0.2, 1);
   flash.visible = false;
   g.add(flash);
   g.userData.flash = flash;
 
-  g.position.set(0.305, -0.16, -0.62);
-  g.rotation.set(-0.05, 0.15, 0.015);
-  g.scale.setScalar(0.95);
+  g.position.set(0.31, -0.2, -0.64);
+  g.rotation.set(-0.06, 0.26, 0.02);
+  g.scale.setScalar(0.8);
   return g;
 }
 
 function buildGlove() {
   const g = new THREE.Group();
-  const shell = new THREE.MeshBasicMaterial({ color: 0x594a3b });
-  const pad = new THREE.MeshBasicMaterial({ color: 0x7c6851 });
-  const darkMetal = new THREE.MeshBasicMaterial({ color: 0x2e261e });
+  const shell = viewMaterial(0x261f18, 0.86, 0.04);
+  const pad = viewMaterial(0x463725, 0.8, 0.06);
+  const darkMetal = viewMaterial(0x191713, 0.6, 0.32);
   const glow = new THREE.MeshBasicMaterial({ color: 0xff9d2e, toneMapped: false });
 
-  const palm = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.055, 0.16), shell);
+  // Palm and articulated fingers, built from rounded volumes so the glove reads
+  // as a hand rather than a floating tan block.
+  const palm = new THREE.Mesh(new RoundedBoxGeometry(0.135, 0.062, 0.18, 3, 0.024), shell);
+  palm.position.set(0, 0, 0);
   g.add(palm);
+  const backPad = new THREE.Mesh(new RoundedBoxGeometry(0.082, 0.012, 0.085, 2, 0.006), pad);
+  backPad.position.set(0, 0.038, 0.015);
+  g.add(backPad);
   for (let i = 0; i < 4; i++) {
-    const finger = new THREE.Mesh(new THREE.BoxGeometry(0.025, 0.028, 0.1), i === 0 ? pad : shell);
-    finger.position.set(-0.042 + i * 0.028, 0, -0.12);
-    finger.rotation.x = -0.32;
+    const finger = new THREE.Mesh(new RoundedBoxGeometry(0.028, 0.03, 0.115, 2, 0.011), i === 0 ? pad : shell);
+    finger.position.set(-0.045 + i * 0.03, 0, -0.135);
+    finger.rotation.x = -0.3;
     g.add(finger);
+    const tip = new THREE.Mesh(new RoundedBoxGeometry(0.026, 0.026, 0.035, 2, 0.009), shell);
+    tip.position.set(-0.045 + i * 0.03, -0.026, -0.19);
+    tip.rotation.x = -0.5;
+    g.add(tip);
   }
-  const thumb = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.034, 0.075), shell);
-  thumb.position.set(0.07, -0.005, -0.035);
-  thumb.rotation.y = -0.55;
+  const thumb = new THREE.Mesh(new RoundedBoxGeometry(0.034, 0.04, 0.095, 2, 0.012), pad);
+  thumb.position.set(0.078, -0.008, -0.045);
+  thumb.rotation.set(-0.1, -0.5, 0.08);
   g.add(thumb);
-  const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.062, 0.1, 8), darkMetal);
-  cuff.rotation.x = Math.PI / 2;
-  cuff.position.z = 0.12;
+
+  const cuff = new THREE.Mesh(new RoundedBoxGeometry(0.14, 0.075, 0.095, 3, 0.024), darkMetal);
+  cuff.position.z = 0.13;
   g.add(cuff);
-  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.045, 0.008, 4, 18), glow);
+  const sleeve = new THREE.Mesh(new RoundedBoxGeometry(0.15, 0.13, 0.26, 3, 0.04), darkMetal);
+  sleeve.position.set(0, -0.01, 0.27);
+  sleeve.rotation.x = 0.08;
+  g.add(sleeve);
+  const sleeveBand = new THREE.Mesh(new RoundedBoxGeometry(0.155, 0.018, 0.03, 2, 0.006), pad);
+  sleeveBand.position.set(0, 0.045, 0.22);
+  g.add(sleeveBand);
+
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.05, 0.008, 4, 20), glow);
   ring.rotation.x = -Math.PI / 2;
-  ring.position.set(0, 0.031, 0.0);
+  ring.position.set(0, 0.036, 0.005);
   g.add(ring);
-  const chip = new THREE.Mesh(new THREE.BoxGeometry(0.026, 0.012, 0.04), glow);
-  chip.position.set(0, 0.032, 0.07);
+  const chip = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.014, 0.045), glow);
+  chip.position.set(0, 0.038, 0.075);
   g.add(chip);
   const cuffLight = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.02, 0.06), glow);
-  cuffLight.position.set(0, 0.045, 0.13);
+  cuffLight.position.set(0, 0.042, 0.145);
   g.add(cuffLight);
   const aura = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: glowTexture, color: 0xff9d2e, transparent: true, opacity: 0.45,
+    map: glowTexture, color: 0xff9d2e, transparent: true, opacity: 0.38,
     blending: THREE.AdditiveBlending, depthWrite: false,
   }));
-  aura.position.set(0, 0.03, 0);
-  aura.scale.set(0.26, 0.26, 1);
+  aura.position.set(0, 0.035, -0.005);
+  aura.scale.set(0.24, 0.24, 1);
   g.add(aura);
 
   g.position.set(-0.26, -0.27, -0.45);
@@ -1297,14 +1492,14 @@ function updateWeapons(dt) {
   gun.visible = !holding;
   glove.visible = holding;
   gun.position.set(
-    0.29 + bobX - game.lookDx * 0.0005,
-    -0.17 - bobY + reloadArc * -0.11 + game.recoil * -0.3,
-    -0.6 + reloadArc * 0.04 + game.recoil * 1.4
+    0.30 + bobX - game.lookDx * 0.0005,
+    -0.19 - bobY + reloadArc * -0.11 + game.recoil * -0.3,
+    -0.62 + reloadArc * 0.04 + game.recoil * 1.4
   );
   gun.rotation.set(
-    -0.05 + reloadArc * -0.55 + game.recoil * 2.4,
-    0.15 + game.lookDx * 0.0007,
-    0.015 - reloadArc * 0.3
+    -0.06 + reloadArc * -0.55 + game.recoil * 2.4,
+    0.26 + game.lookDx * 0.0007,
+    0.02 - reloadArc * 0.3
   );
   glove.position.set(
     -0.26 + bobX * 0.6,
@@ -1714,6 +1909,7 @@ function updateMenuCamera(dt) {
 function updateAmbient(dt, time) {
   particles.update(dt, time);
   dust.update(time, dt);
+  rain.update(dt, time);
   updateEffects(dt);
   if (world.beams) {
     world.beams[0].rotation.y += dt * 0.08;
@@ -1749,14 +1945,20 @@ function frame() {
   }
 
   updateAmbient(dt, time);
-  renderer.render(scene, camera);
+  if (composer) composer.render();
+  else renderer.render(scene, camera);
 }
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+  renderer.setPixelRatio(pixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
+  if (composer) {
+    composer.setPixelRatio(pixelRatio);
+    composer.setSize(window.innerWidth, window.innerHeight);
+  }
   if (isTouch) $('rotate-note').classList.toggle('hidden', window.innerHeight <= window.innerWidth || game.mode !== 'playing');
 });
 
@@ -1769,6 +1971,7 @@ requestAnimationFrame(() => {
 });
 
 window.__gravity = {
+  THREE,
   game,
   player,
   enemies,
@@ -1789,6 +1992,9 @@ window.__gravity = {
   renderer,
   gun,
   glove,
+  composer,
+  gtaoPass,
+  bloomPass,
   audio,
   isTouch,
 };
