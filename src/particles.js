@@ -148,6 +148,61 @@ export class Particles {
   }
 }
 
+// Sparse drizzle. Drops are line segments so they read as motion streaks rather
+// than the usual dotted particle rain.
+export function createRain(scene, count = 520) {
+  const positions = new Float32Array(count * 6);
+  const drops = [];
+  const reset = (drop, initial = false) => {
+    drop.x = (Math.random() - 0.5) * 78;
+    drop.z = (Math.random() - 0.5) * 78;
+    drop.y = initial ? Math.random() * 24 : 18 + Math.random() * 6;
+    drop.speed = 13 + Math.random() * 9;
+    drop.len = 0.22 + Math.random() * 0.5;
+    drop.drift = 0.55 + Math.random() * 0.7;
+  };
+  for (let i = 0; i < count; i++) {
+    const drop = {};
+    reset(drop, true);
+    drops.push(drop);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.LineBasicMaterial({
+    color: 0xa8bfd4,
+    transparent: true,
+    opacity: 0.2,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const lines = new THREE.LineSegments(geometry, material);
+  lines.frustumCulled = false;
+  scene.add(lines);
+
+  return {
+    lines,
+    update(dt) {
+      for (let i = 0; i < count; i++) {
+        const drop = drops[i];
+        drop.y -= drop.speed * dt;
+        drop.x += drop.drift * dt;
+        drop.z += drop.drift * 0.35 * dt;
+        if (drop.y < -0.2) reset(drop);
+        if (drop.x > 39) drop.x = -39;
+        if (drop.z > 39) drop.z = -39;
+        const i6 = i * 6;
+        positions[i6] = drop.x;
+        positions[i6 + 1] = drop.y;
+        positions[i6 + 2] = drop.z;
+        positions[i6 + 3] = drop.x - drop.drift * 0.045;
+        positions[i6 + 4] = drop.y + drop.len;
+        positions[i6 + 5] = drop.z - drop.drift * 0.016;
+      }
+      geometry.attributes.position.needsUpdate = true;
+    },
+  };
+}
+
 export function createDust(scene) {
   const count = 320;
   const positions = new Float32Array(count * 3);

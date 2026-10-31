@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { createWorld, makeProp, PROP_SPAWNS } from './world.js';
-import { Particles, createDust } from './particles.js';
+import { Particles, createDust, createRain } from './particles.js';
 import { AudioEngine } from './audio.js';
+import { createPostFX } from './effects.js';
 
 const $ = (id) => document.getElementById(id);
 const clamp = THREE.MathUtils.clamp;
@@ -15,33 +16,49 @@ document.body.classList.toggle('touch-ui', isTouch);
 const canvas = $('game');
 const renderer = new THREE.WebGLRenderer({
   canvas,
-  antialias: false,
+  antialias: true,
   powerPreference: 'high-performance',
   alpha: false,
 });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isTouch ? 1.25 : 1.75));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.25;
+renderer.toneMappingExposure = 1.02;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.05, 400);
+const camera = new THREE.PerspectiveCamera(68, window.innerWidth / window.innerHeight, 0.045, 420);
 camera.rotation.order = 'YXZ';
 scene.add(camera);
 
 // suit lamp — keeps the foreground readable without flattening the scene
-const suitLight = new THREE.PointLight(0xffd2a4, 30, 22, 2);
-suitLight.position.set(0.3, -0.15, -1.2);
+const suitLight = new THREE.PointLight(0xffd2a4, 46, 24, 2);
+suitLight.position.set(0.35, -0.15, -1.15);
 camera.add(suitLight);
+
 
 const clock = new THREE.Clock();
 
 // ---------------------------------------------------------------- world
-const world = createWorld(scene);
+const world = createWorld(scene, renderer);
 const particles = new Particles(scene);
 const dust = createDust(scene);
+const rain = createRain(scene);
 const audio = new AudioEngine();
+
+// Make the static set participate in the moonlight shadow pass. Flat planes
+// (ground, puddles, decals) only receive, so they never throw artefacts.
+scene.traverse((o) => {
+  if (!o.isMesh) return;
+  const planar = o.geometry && o.geometry.type === 'PlaneGeometry';
+  o.castShadow = !planar && !o.material?.transparent;
+  o.receiveShadow = true;
+});
+if (world.moonLight) world.moonLight.shadow.normalBias = 0.03;
+
+const post = createPostFX(renderer, scene, camera, { enabled: !isTouch });
 
 // ---------------------------------------------------------------- player
 const player = {
@@ -236,7 +253,11 @@ class Drone {
     group.add(glow);
 
     group.traverse((o) => {
-      if (o.isMesh) o.userData.enemy = this;
+      if (o.isMesh) {
+        o.userData.enemy = this;
+        o.castShadow = !o.material.transparent;
+        o.receiveShadow = false;
+      }
     });
     group.userData.enemy = this;
     scene.add(group);
@@ -339,18 +360,21 @@ camera.add(viewModels);
 
 function buildGun() {
   const g = new THREE.Group();
-  const dark = new THREE.MeshBasicMaterial({ color: 0x10161b });
-  const mid = new THREE.MeshBasicMaterial({ color: 0x27323b });
-  const light = new THREE.MeshBasicMaterial({ color: 0x46545f });
-  const glow = new THREE.MeshBasicMaterial({ color: 0x66d9ff, toneMapped: false });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x10161b, metalness: 0.55, roughness: 0.52 });
+  const mid = new THREE.MeshStandardMaterial({ color: 0x27323b, metalness: 0.72, roughness: 0.38, envMapIntensity: 1.1 });
+  const light = new THREE.MeshStandardMaterial({ color: 0x46545f, metalness: 0.86, roughness: 0.22, envMapIntensity: 1.3 });
+  const glow = new THREE.MeshBasicMaterial({ color: 0x4dabc7, toneMapped: false });
 
-  // Fake directional shading: unlit viewmodel boxes read as flat slabs unless each
-  // face gets its own value. Box material order is +x, -x, +y, -y, +z, -z.
-  const shaded = (topColor, sideColor, bottomColor, frontColor) => {
-    const topM = new THREE.MeshBasicMaterial({ color: topColor });
-    const sideM = new THREE.MeshBasicMaterial({ color: sideColor });
-    const bottomM = new THREE.MeshBasicMaterial({ color: bottomColor });
-    const frontM = new THREE.MeshBasicMaterial({ color: frontColor });
+  // The view model still uses face-tinted materials, but now they are lit PBR
+  // surfaces so the slide catches the moon and the suit lamp.
+  const shaded = (topColor, sideColor, bottomColor, frontColor, metalness = 0.42, roughness = 0.46) => {
+    const make = (color) => new THREE.MeshStandardMaterial({
+      color, metalness, roughness, envMapIntensity: 1.15,
+    });
+    const topM = make(topColor);
+    const sideM = make(sideColor);
+    const bottomM = make(bottomColor);
+    const frontM = make(frontColor);
     return [sideM, sideM, topM, bottomM, frontM, frontM];
   };
   const box = (w, h, d, mats, x, y, z, rx = 0) => {
@@ -361,9 +385,9 @@ function buildGun() {
     return m;
   };
 
-  const slideMats = shaded(0x3d4a55, 0x232d35, 0x141b21, 0x1d262d);
-  const bodyMats = shaded(0x34414b, 0x1d262d, 0x0e1216, 0x161d23);
-  const gripMats = shaded(0x2c363f, 0x171e24, 0x0b0e11, 0x12171c);
+  const slideMats = shaded(0x55636f, 0x39454f, 0x212a31, 0x2e3942);
+  const bodyMats = shaded(0x46545f, 0x2c3740, 0x182027, 0x222b33);
+  const gripMats = shaded(0x394650, 0x252e35, 0x14191e, 0x1d242a);
 
   box(0.1, 0.105, 0.29, bodyMats, 0, 0.01, -0.01);
   box(0.088, 0.05, 0.31, slideMats, 0, 0.078, -0.02);
@@ -423,6 +447,38 @@ function buildGun() {
   sightDot.position.set(0, 0.124, -0.162);
   g.add(sightDot);
 
+  // Gloved support hand wrapped around the grip. Without it the pistol reads as
+  // a floating prop; a forearm reaching off-screen anchors it to the player.
+  const leather = new THREE.MeshStandardMaterial({
+    color: 0x544434, roughness: 0.82, metalness: 0.03, envMapIntensity: 0.5,
+  });
+  const leatherDark = new THREE.MeshStandardMaterial({
+    color: 0x33271e, roughness: 0.88, metalness: 0.02, envMapIntensity: 0.4,
+  });
+  const palm = new THREE.Mesh(new THREE.BoxGeometry(0.105, 0.145, 0.105), leather);
+  palm.position.set(0.048, -0.158, 0.126);
+  palm.rotation.set(-0.18, 0.1, 0.08);
+  g.add(palm);
+  for (let i = 0; i < 4; i++) {
+    const finger = new THREE.Mesh(new THREE.CapsuleGeometry(0.0135, 0.052, 3, 6), i === 0 ? leatherDark : leather);
+    finger.position.set(0.056, -0.105 - i * 0.027, 0.061 - i * 0.002);
+    finger.rotation.x = -0.45;
+    finger.rotation.z = 0.12;
+    g.add(finger);
+  }
+  const thumb = new THREE.Mesh(new THREE.CapsuleGeometry(0.015, 0.06, 3, 6), leather);
+  thumb.position.set(-0.018, -0.105, 0.135);
+  thumb.rotation.set(-0.5, 0.2, -0.85);
+  g.add(thumb);
+  const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.047, 0.051, 0.075, 10), leatherDark);
+  cuff.rotation.set(-0.62, 0.05, -0.16);
+  cuff.position.set(0.072, -0.245, 0.175);
+  g.add(cuff);
+  const forearm = new THREE.Mesh(new THREE.CylinderGeometry(0.052, 0.042, 0.34, 10), leather);
+  forearm.rotation.set(-0.74, 0.04, -0.18);
+  forearm.position.set(0.1, -0.39, 0.29);
+  g.add(forearm);
+
   const muzzlePoint = new THREE.Object3D();
   muzzlePoint.position.set(0, 0.035, -0.345);
   g.add(muzzlePoint);
@@ -438,9 +494,9 @@ function buildGun() {
   g.add(flash);
   g.userData.flash = flash;
 
-  g.position.set(0.305, -0.16, -0.62);
+  g.position.set(0.32, -0.2, -0.68);
   g.rotation.set(-0.05, 0.15, 0.015);
-  g.scale.setScalar(0.95);
+  g.scale.setScalar(0.84);
   return g;
 }
 
@@ -495,6 +551,7 @@ const gun = buildGun();
 const glove = buildGlove();
 viewModels.add(gun, glove);
 viewModels.visible = false;
+viewModels.traverse((o) => { o.castShadow = false; o.receiveShadow = false; });
 
 // glove beam
 const beamGeo = new THREE.BufferGeometry();
@@ -1297,9 +1354,9 @@ function updateWeapons(dt) {
   gun.visible = !holding;
   glove.visible = holding;
   gun.position.set(
-    0.29 + bobX - game.lookDx * 0.0005,
-    -0.17 - bobY + reloadArc * -0.11 + game.recoil * -0.3,
-    -0.6 + reloadArc * 0.04 + game.recoil * 1.4
+    0.32 + bobX - game.lookDx * 0.0005,
+    -0.2 - bobY + reloadArc * -0.11 + game.recoil * -0.3,
+    -0.68 + reloadArc * 0.04 + game.recoil * 1.4
   );
   gun.rotation.set(
     -0.05 + reloadArc * -0.55 + game.recoil * 2.4,
@@ -1714,10 +1771,14 @@ function updateMenuCamera(dt) {
 function updateAmbient(dt, time) {
   particles.update(dt, time);
   dust.update(time, dt);
+  rain.update(dt);
   updateEffects(dt);
   if (world.beams) {
     world.beams[0].rotation.y += dt * 0.08;
     world.beams[1].rotation.y -= dt * 0.06;
+  }
+  if (world.fans) {
+    for (const fan of world.fans) fan.rotor.rotation.y += dt * fan.speed;
   }
   if (world.emblem) world.emblem.material.opacity = 0.58 + Math.sin(time * 1.4) * 0.08;
 }
@@ -1749,14 +1810,15 @@ function frame() {
   }
 
   updateAmbient(dt, time);
-  renderer.render(scene, camera);
+  post.render(dt);
 }
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isTouch ? 1.25 : 1.75));
   renderer.setSize(window.innerWidth, window.innerHeight);
+  post.setSize(window.innerWidth, window.innerHeight);
   if (isTouch) $('rotate-note').classList.toggle('hidden', window.innerHeight <= window.innerWidth || game.mode !== 'playing');
 });
 
@@ -1787,6 +1849,7 @@ window.__gravity = {
   camera,
   scene,
   renderer,
+  post,
   gun,
   glove,
   audio,
